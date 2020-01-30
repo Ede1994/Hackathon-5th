@@ -406,7 +406,7 @@ def main():
         optimise_array = np.reshape(
             scipy.optimize.minimize(objective_function, np.ravel(optimise_array).astype(np.double),
                                     args=(resamplers, dynamic_array, static_image, output_path[i]), method="L-BFGS-B",
-                                    jac=gradient_function, bounds=bounds, tol=0.00000000001,
+                                    jac=gradient_function, bounds=bounds, tol=0.0000000001,
                                     options={"disp": True}).x, optimise_array.shape)
 
         # output
