@@ -1,11 +1,22 @@
-import nibabel
+# Copyright University College London 2020
+# Author: Alexander Whitehead, Institute of Nuclear Medicine, UCL
+# Author: Eric Einspänner
+# For internal research only.
+
+
+import os
+import sys
+import distutils.util
+import re
+import numpy as np
 import scipy.optimize
+import nibabel
+
 import sirf.Reg as reg
 import sirf.Reg as eng_ref
 import sirf.Reg as eng_flo
-import os
-import numpy as np
-import re
+
+import parser
 
 
 # https://stackoverflow.com/questions/5967500/how-to-correctly-sort-a-string-with-a-number-inside
@@ -19,44 +30,30 @@ def human_sorting(string):
 
 
 def warp_image_forward(resampler, static_image):
-    return resampler.forward(static_image).as_array()
+    return resampler.forward(static_image).as_array().astype(np.double)
 
 
 def warp_image_adjoint(resampler, dynamic_image):
-    return resampler.adjoint(dynamic_image).as_array()
+    return resampler.adjoint(dynamic_image).as_array().astype(np.double)
 
 
-def edit_header(data, output_path):
-    new_data = []
-
-    for i in range(len(data)):
-        current_data = nibabel.load(data[i])
-        current_data.header["intent_code"] = 1007
-
-        current_data_path = "{0}/new_dvf_{1}.nii".format(output_path, str(i))
-
-        nibabel.save(current_data, current_data_path)
-
-        new_data.append(current_data_path)
-
-    return new_data
-
-
-def objective_function(static_array, resampler, dynamic_images, static_image):
-    static_image.fill(np.reshape(static_array, static_image.as_array().shape))
+def objective_function(optimise_array, resampler, dynamic_images, static_image, output_path):
+    static_image.fill(np.reshape(optimise_array, static_image.as_array().astype(np.double).shape))
 
     objective_value = 0.0
 
     for i in range(len(dynamic_images)):
-        objective_value = objective_value + (np.nansum(np.square(dynamic_images[i].as_array() - warp_image_forward(resampler[i], static_image)), dtype=np.double) / 2.0)
+        objective_value = objective_value + (np.nansum(
+            np.square(dynamic_images[i].as_array().astype(np.double) - warp_image_forward(resampler[i], static_image),
+                      dtype=np.double), dtype=np.double) / 2.0)
 
     print("Objective function value: {0}".format(str(objective_value)))
 
     return objective_value
 
 
-def gradient_function(static_array, resampler, dynamic_images, static_image):
-    static_image.fill(np.reshape(static_array, static_image.as_array().shape))
+def gradient_function(optimise_array, resampler, dynamic_images, static_image, output_path):
+    static_image.fill(np.reshape(optimise_array, static_image.as_array().astype(np.double).shape))
 
     gradient_value = static_image.clone()
     gradient_value.fill(0.0)
@@ -64,73 +61,47 @@ def gradient_function(static_array, resampler, dynamic_images, static_image):
     adjoint_image = static_image.clone()
 
     for i in range(len(dynamic_images)):
-        static_image.write("/home/sirfuser/Shared_Folder/temp_static.nii")
-        dynamic_images[i].write("/home/sirfuser/Shared_Folder/temp_dynamic.nii")
+        static_image.write("{0}/temp_static.nii".format(output_path))
+        dynamic_images[i].write("{0}/temp_dynamic.nii".format(output_path))
 
-        temp_static = reg.NiftiImageData("/home/sirfuser/Shared_Folder/temp_static.nii")
-        temp_dynamic = reg.NiftiImageData("/home/sirfuser/Shared_Folder/temp_dynamic.nii")
+        temp_static = reg.NiftiImageData("{0}/temp_static.nii".format(output_path))
+        temp_dynamic = reg.NiftiImageData("{0}/temp_dynamic.nii".format(output_path))
 
-        adjoint_image.fill(warp_image_forward(resampler[i], temp_static) - temp_dynamic.as_array())
+        adjoint_image.fill(warp_image_forward(resampler[i], temp_static) - temp_dynamic.as_array().astype(np.double))
 
-        gradient_value.fill(gradient_value.as_array() + warp_image_adjoint(resampler[i], adjoint_image))
+        gradient_value.fill(
+            (gradient_value.as_array().astype(np.double) + warp_image_adjoint(resampler[i], adjoint_image)))
 
-    gradient_value.write("/home/sirfuser/Shared_Folder/gradient.nii")
+    gradient_value.write("{0}/gradient.nii".format(output_path))
 
-    print("Max gradient value: {0}, Min gradient value: {1}, Mean gradient value: {2}, Gradient norm: {3}".format(str(gradient_value.as_array().max()), str(gradient_value.as_array().min()), str(np.nanmean(gradient_value.as_array())), str(np.linalg.norm(gradient_value.as_array()))))
+    print("Max gradient value: {0}, Min gradient value: {1}, Mean gradient value: {2}, Gradient norm: {3}".format(
+        str(gradient_value.as_array().astype(np.double).max()), str(gradient_value.as_array().astype(np.double).min()),
+        str(np.nanmean(gradient_value.as_array().astype(np.double), dtype=np.double)),
+        str(np.linalg.norm(gradient_value.as_array().astype(np.double)))))
 
-    return np.ravel(gradient_value.as_array())
-
-
-def register_data(ref_file, input_data):
-    path_new_displacementfields = '/home/sirfuser/Shared_Folder/new_displacement_fields/'
-    if not os.path.exists(path_new_displacementfields):
-        os.makedirs(path_new_displacementfields, mode=0o770)
-
-    path_new_deformationfields = '/home/sirfuser/Shared_Folder/new_deformation_fields/'
-    if not os.path.exists(path_new_deformationfields):
-        os.makedirs(path_new_deformationfields, mode=0o770)
-
-    path_new_tm = '/home/sirfuser/Shared_Folder/new_tm/'
-    if not os.path.exists(path_new_tm):
-        os.makedirs(path_new_tm, mode=0o770)
-
-    algo = reg.NiftyAladinSym()
-
-    dvf_array = []
-
-    for i in range(len(input_data)):
-        flo_file = input_data[i]
-        ref = eng_ref.ImageData(ref_file)
-        flo = eng_flo.ImageData(flo_file)
-
-        algo.set_reference_image(ref)
-        algo.set_floating_image(flo)
-
-        algo.process()
-
-        output = algo.get_displacement_field_forward()
-        output.write('{0}new_displacement_field{1}.nii'.format(path_new_displacementfields, str(i)))
-
-        dvf_array.append('{0}new_DVF_field{1}.nii'.format(path_new_deformationfields, str(i)))
-
-        output2 = algo.get_deformation_field_forward()
-        output2.write(dvf_array[i])
-
-        tm = algo.get_transformation_matrix_forward()
-        tm.write('{0}new_tm{1}.nii'.format(path_new_tm, str(i)))
-
-    return dvf_array
+    return np.ravel(gradient_value.as_array().astype(np.double)).astype(np.double)
 
 
-def test_for_adj(static_image, input_array, dvf_array):
-    for i in range(len(input_array)):
-        static_image.write("/home/sirfuser/Shared_Folder/temp_static.nii")
-        input_array[i].write("/home/sirfuser/Shared_Folder/temp_dynamic.nii")
-        dvf_array[i].write("/home/sirfuser/Shared_Folder/temp_dvf.nii")
+def output_input(static_image, dynamic_array, dvf_array, output_path):
+    static_image.write("{0}/static_image.nii".format(output_path))
 
-        temp_static = reg.NiftiImageData("/home/sirfuser/Shared_Folder/temp_static.nii")
-        temp_dynamic = reg.NiftiImageData("/home/sirfuser/Shared_Folder/temp_dynamic.nii")
-        temp_dvf = reg.NiftiImageData3DDeformation("/home/sirfuser/Shared_Folder/temp_dvf.nii")
+    for i in range(len(dynamic_array)):
+        dynamic_array[i].write("{0}/dynamic_array_{1}.nii".format(output_path, str(i)))
+        dvf_array[i].write("{0}/dvf_array_{1}.nii".format(output_path, str(i)))
+
+    return True
+
+
+def test_for_adj(static_image, dvf_array, output_path):
+    static_image_path = "{0}/temp_static.nii".format(output_path)
+    dvf_array_path = "{0}/temp_dvf.nii".format(output_path)
+
+    for i in range(len(dvf_array)):
+        static_image.write(static_image_path)
+        dvf_array[i].write(dvf_array_path)
+
+        temp_static = reg.NiftiImageData(static_image_path)
+        temp_dvf = reg.NiftiImageData3DDeformation(dvf_array_path)
 
         resampler = reg.NiftyResample()
 
@@ -145,125 +116,309 @@ def test_for_adj(static_image, input_array, dvf_array):
         warped_image = static_image.clone()
         warped_image.fill(warp)
 
-        warped_image.write("/home/sirfuser/Shared_Folder/warp_forward_{0}.nii".format(str(i)))
+        warped_image.write("{0}/warp_forward_{1}.nii".format(output_path, str(i)))
 
-        difference = temp_static.as_array() - warp
+        difference = temp_static.as_array().astype(np.double) - warp
 
         difference_image = temp_static.clone()
         difference_image.fill(difference)
 
-        difference_image.write("/home/sirfuser/Shared_Folder/warp_forward_difference_{0}.nii".format(str(i)))
+        difference_image.write("{0}/warp_forward_difference_{1}.nii".format(output_path, str(i)))
 
         warp = warp_image_adjoint(resampler, temp_static)
 
-        warped_image = temp_dynamic.clone()
+        warped_image = temp_static.clone()
         warped_image.fill(warp)
 
-        warped_image.write("/home/sirfuser/Shared_Folder/warp_adjoint_{0}.nii".format(str(i)))
+        warped_image.write("{0}/warp_adjoint_{1}.nii".format(output_path, str(i)))
 
-        difference = temp_static.as_array() - warp
+        difference = temp_static.as_array().astype(np.double) - warp
 
         difference_image = temp_static.clone()
         difference_image.fill(difference)
 
-        difference_image.write("/home/sirfuser/Shared_Folder/warp_adjoint_difference_{0}.nii".format(str(i)))
+        difference_image.write("{0}/warp_adjoint_difference_{1}.nii".format(output_path, str(i)))
 
     return True
 
 
-def get_data_path(data_path):
-    all_input_data = os.listdir(data_path)
-    input_data = []
+def get_resamplers(static_image, dynamic_array, dvf_array, output_path):
+    resamplers = []
 
-    for i in range(len(all_input_data)):
-        current_input_data = all_input_data[i].rstrip()
+    static_image_path = "{0}/temp_static.nii".format(output_path)
+    dynamic_array_path = "{0}/temp_dynamic.nii".format(output_path)
+    dvf_array_path = "{0}/temp_dvf.nii".format(output_path)
 
-        if len(current_input_data.split(".nii")) > 1 and len(current_input_data.split("fixed")) > 1:
-            input_data.append("{0}/{1}".format(data_path, current_input_data))
+    for j in range(len(dynamic_array)):
+        resampler = reg.NiftyResample()
 
-    input_data.sort(key=human_sorting)
+        static_image.write(static_image_path)
+        dynamic_array[j].write(dynamic_array_path)
+        dvf_array[j].write(dvf_array_path)
 
-    return input_data
+        temp_static = reg.NiftiImageData(static_image_path)
+        temp_dynamic = reg.NiftiImageData(dynamic_array_path)
+        temp_dvf = reg.NiftiImageData3DDeformation(dvf_array_path)
+
+        resampler.set_reference_image(temp_static)
+        resampler.set_floating_image(temp_dynamic)
+        resampler.add_transformation(temp_dvf)
+
+        resampler.set_interpolation_type_to_linear()
+
+        resamplers.append(resampler)
+
+    return resamplers
 
 
-def get_dvf_path(dvf_path):
-    all_dvf_data = os.listdir(dvf_path)
-    dvf_data = []
+def edit_header(data, output_path):
+    new_data_array = []
 
-    for i in range(len(all_dvf_data)):
-        current_dvf_data = all_dvf_data[i].rstrip()
+    for i in range(len(data)):
+        current_data = nibabel.load(data[i])
 
-        if len(current_dvf_data.split("DVF")) > 1:
-            dvf_data.append("{0}/{1}".format(dvf_path, current_dvf_data))
+        current_data_data = current_data.get_data()
+        current_data_affine = current_data.affine
+        current_data_header = current_data.header
 
-    dvf_data.sort(key=human_sorting)
+        current_data_header["intent_code"] = 1007
 
-    return dvf_data
+        new_data = nibabel.Nifti1Image(current_data_data, current_data_affine, current_data_header)
+
+        new_data_path = "{0}/new_dvf_{1}.nii".format(output_path, str(i))
+
+        if os.path.exists(new_data_path):
+            os.remove(new_data_path)
+
+        nibabel.save(new_data, new_data_path)
+
+        new_data_array.append(new_data_path)
+
+    return new_data_array
+
+
+def register_data(static_path, dynamic_path, output_path):
+    path_new_displacement_fields = "{0}/new_displacement_fields/".format(output_path)
+
+    if not os.path.exists(path_new_displacement_fields):
+        os.makedirs(path_new_displacement_fields, mode=0o770)
+
+    path_new_deformation_fields = "{0}/new_deformation_fields/".format(output_path)
+
+    if not os.path.exists(path_new_deformation_fields):
+        os.makedirs(path_new_deformation_fields, mode=0o770)
+
+    path_new_tm = "{0}/new_tm/".format(output_path)
+
+    if not os.path.exists(path_new_tm):
+        os.makedirs(path_new_tm, mode=0o770)
+
+    algo = reg.NiftyAladinSym()
+
+    dvf_path = []
+
+    for i in range(len(dynamic_path)):
+        ref = eng_ref.ImageData(static_path)
+        flo = eng_flo.ImageData(dynamic_path[i])
+
+        algo.set_reference_image(ref)
+        algo.set_floating_image(flo)
+
+        algo.process()
+
+        displacement_field = algo.get_displacement_field_forward()
+        displacement_field.write("{0}/new_displacement_field_{1}.nii".format(path_new_displacement_fields, str(i)))
+
+        dvf_path.append("{0}/new_DVF_field_{1}.nii".format(path_new_deformation_fields, str(i)))
+
+        deformation_field = algo.get_deformation_field_forward()
+        deformation_field.write(dvf_path[i])
+
+        tm = algo.get_transformation_matrix_forward()
+        tm.write("{0}/new_tm_{1}.nii".format(path_new_tm, str(i)))
+
+    return dvf_path
+
+
+def op_test(static_image, output_path):
+    static_image_path = "{0}/temp_static.nii".format(output_path)
+
+    static_image.write(static_image_path)
+
+    temp_static = reg.NiftiImageData(static_image_path)
+
+    temp_at = reg.AffineTransformation()
+
+    temp_at_array = temp_at.as_array()
+    temp_at_array[0][0] = 1.25
+    temp_at_array[1][1] = 1.25
+    temp_at_array[2][2] = 1.25
+    temp_at_array[3][3] = 1.25
+
+    temp_at = reg.AffineTransformation(temp_at_array)
+
+    resampler = reg.NiftyResample()
+
+    resampler.set_reference_image(temp_static)
+    resampler.set_floating_image(temp_static)
+    resampler.add_transformation(temp_at)
+
+    resampler.set_interpolation_type_to_linear()
+
+    warp = warp_image_forward(resampler, temp_static)
+
+    warped_image = static_image.clone()
+    warped_image.fill(warp)
+
+    warped_image.write("{0}/op_test_warp_forward.nii".format(output_path))
+
+    difference = temp_static.as_array().astype(np.double) - warp
+
+    difference_image = temp_static.clone()
+    difference_image.fill(difference)
+
+    difference_image.write("{0}/op_test_warp_forward_difference.nii".format(output_path))
+
+    warp = warp_image_adjoint(resampler, temp_static)
+
+    warped_image = temp_static.clone()
+    warped_image.fill(warp)
+
+    warped_image.write("{0}/op_test_warp_adjoint.nii".format(output_path))
+
+    difference = temp_static.as_array().astype(np.double) - warp
+
+    difference_image = temp_static.clone()
+    difference_image.fill(difference)
+
+    difference_image.write("{0}/warp_adjoint_difference.nii".format(output_path))
+
+    return True
+
+
+def get_dvf_path(input_dvf_path, dvf_split):
+    all_dvf_path = os.listdir(input_dvf_path)
+    dvf_path = []
+
+    for i in range(len(all_dvf_path)):
+        current_dvf_path = all_dvf_path[i].rstrip()
+
+        if len(current_dvf_path.split(".nii")) > 1 and len(current_dvf_path.split(dvf_split)) > 1:
+            dvf_path.append("{0}/{1}".format(input_dvf_path, current_dvf_path))
+
+    dvf_path.sort(key=human_sorting)
+
+    return dvf_path
+
+
+def get_data_path(input_dynamic_path, dynamic_split):
+    all_dynamic_path = os.listdir(input_dynamic_path)
+    dynamic_path = []
+
+    for i in range(len(all_dynamic_path)):
+        current_dynamic_path = all_dynamic_path[i].rstrip()
+
+        if len(current_dynamic_path.split(".nii")) > 1 and len(current_dynamic_path.split(dynamic_split)) > 1:
+            dynamic_path.append("{0}/{1}".format(input_dynamic_path, current_dynamic_path))
+
+    dynamic_path.sort(key=human_sorting)
+
+    return dynamic_path
 
 
 def main():
     # file paths to data
-    data_path = '/home/sirfuser/Shared_Folder/cropped_input/dynamic'
-    dvf_path = '/home/sirfuser/Shared_Folder/new_deformation_fields'
-    new_dvf_path = '/home/sirfuser/Shared_Folder/D_fields_new'
+    input_data_path = parser.parser(sys.argv[1], "data_path:=")
+    data_split = parser.parser(sys.argv[1], "data_split:=")
+    input_dvf_path = parser.parser(sys.argv[1], "dvf_path:=")
+    dvf_split = parser.parser(sys.argv[1], "dvf_split:=")
+    output_path = parser.parser(sys.argv[1], "output_path:=")
+    do_op_test = parser.parser(sys.argv[1], "do_op_test:=")
+    do_reg = parser.parser(sys.argv[1], "do_reg:=")
+    do_test_for_adj = parser.parser(sys.argv[1], "do_test_for_adj:=")
 
-    # get static and dynamic paths
-    input_data = get_data_path(data_path)
-    static_data = input_data[0]
+    for i in range(len(input_data_path)):
+        if not os.path.exists(output_path[i]):
+            os.makedirs(output_path[i], mode=0o770)
 
-    # if do reg the calc dvf if not load
-    do_reg = False
+        new_dvf_path = "{0}/new_dvfs/".format(output_path[i])
 
-    if do_reg:
-        dvf_data = register_data(static_data, input_data)
-    else:
-        dvf_data = get_dvf_path(dvf_path)
+        if not os.path.exists(new_dvf_path):
+            os.makedirs(new_dvf_path, mode=0o770)
 
-    # load dynamic objects
-    input_array = []
+        # get static and dynamic paths
+        dynamic_path = get_data_path(input_data_path[i], data_split[i])
 
-    for i in range(len(input_data)):
-        input_array.append(reg.NiftiImageData(input_data[i]))
+        # load dynamic objects
+        dynamic_array = []
 
-    # load static objects
-    static_image = reg.NiftiImageData(static_data)
+        for j in range(len(dynamic_path)):
+            dynamic_array.append(reg.NiftiImageData(dynamic_path[j]))
 
-    # fix dvf header and load dvf objects
-    dvf_data = edit_header(dvf_data, new_dvf_path)
+        static_path = "{0}/static_path.nii".format(output_path[i])
 
-    dvf_array = []
+        # load static objects
+        static_image = reg.NiftiImageData(dynamic_path[0])
 
-    for i in range(len(dvf_data)):
-        dvf_array.append(reg.NiftiImageData3DDeformation(dvf_data[i]))
+        for j in range(1, len(dynamic_path)):
+            static_image.fill(static_image.as_array().astype(np.double) + dynamic_array[j].as_array().astype(np.double))
 
-    # create object to get forward and adj
-    resamplers = []
+        static_image.write(static_path)
 
-    for i in range(len(input_array)):
-        resampler = reg.NiftyResample()
+        if bool(distutils.util.strtobool(do_op_test[i])):
+            op_test(static_image, output_path[i])
 
-        resampler.set_reference_image(static_image)
-        resampler.set_floating_image(input_array[i])
-        resampler.add_transformation(dvf_array[i])
+        # if do reg the calc dvf if not load
+        if bool(distutils.util.strtobool(do_reg[i])):
+            dvf_path = register_data(static_path, dynamic_path, output_path[i])
+        else:
+            dvf_path = get_dvf_path(input_dvf_path[i], dvf_split[i])
 
-        resampler.set_interpolation_type_to_cubic_spline()
+        # fix dvf header and load dvf objects
+        dvf_path = edit_header(dvf_path, new_dvf_path)
 
-        resamplers.append(resampler)
+        dvf_array = []
 
-    # test for adj
-    do_test_for_adj = False
+        for j in range(len(dvf_path)):
+            dvf_array.append(reg.NiftiImageData3DDeformation(dvf_path[j]))
 
-    if do_test_for_adj:
-        test_for_adj(static_image, input_array, dvf_array)
+        # create object to get forward and adj
+        resamplers = get_resamplers(static_image, dynamic_array, dvf_array, output_path[i])
 
-    # array to optimise
-    static_array = static_image.as_array()
+        # test for adj
+        if bool(distutils.util.strtobool(do_test_for_adj[i])):
+            test_for_adj(static_image, dvf_array, output_path[i])
+            output_input(static_image, dynamic_array, dvf_array, output_path[i])
 
-    # optimise
-    static_array = np.reshape(scipy.optimize.minimize(objective_function, np.ravel(static_array), args=(resamplers, input_array, static_image), method="CG", jac=gradient_function).x, static_array.shape, options={"disp": True, "maxiter": -10, "gtol": 1.0})
+        # initial static image
+        initial_static_image = static_image.clone()
 
-    # output
-    static_image.fill(static_array)
-    static_image.write("/home/sirfuser/Shared_Folder/OUTPUT.nii")
+        # array to optimise
+        optimise_array = static_image.as_array().astype(np.double)
+
+        # array bounds
+        bounds = []
+
+        for j in range(len(np.ravel(optimise_array.copy()))):
+            bounds.append((-np.inf, np.inf))
+
+        # optimise
+        optimise_array = np.reshape(
+            scipy.optimize.minimize(objective_function, np.ravel(optimise_array).astype(np.double),
+                                    args=(resamplers, dynamic_array, static_image, output_path[i]), method="L-BFGS-B",
+                                    jac=gradient_function, bounds=bounds, tol=0.0000000001,
+                                    options={"disp": True}).x, optimise_array.shape)
+
+        # output
+        static_image.fill(optimise_array)
+        static_image.write("{0}/optimiser_output_{1}.nii".format(output_path[i], str(i)))
+
+        difference = static_image.as_array().astype(np.double) - initial_static_image.as_array().astype(np.double)
+
+        difference_image = initial_static_image.clone()
+        difference_image.fill(difference)
+
+        static_image.write("{0}/optimiser_output_difference_{1}.nii".format(output_path[i], str(i)))
+
 
 main()
